@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import os
@@ -14,6 +13,9 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as XLImage
+from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, OneCellAnchor
+from openpyxl.drawing.xdr import XDRPositiveSize2D
+from openpyxl.utils.units import pixels_to_EMU
 from PIL import Image as PILImage
 
 
@@ -186,9 +188,39 @@ def download_image_bytes(image_url: str) -> Optional[bytes]:
     return resp.content
 
 
-def resize_image_for_excel(image_bytes: bytes, max_w: int = 140, max_h: int = 90) -> XLImage:
+def excel_col_width_to_pixels(width_value: Optional[float]) -> int:
+    if width_value is None:
+        width_value = 8.43
+    return int(width_value * 7 + 5)
+
+
+def row_height_to_pixels(height_value: Optional[float]) -> int:
+    if height_value is None:
+        height_value = 15
+    return int(height_value * 1.333)
+
+
+def create_centered_excel_image(
+    ws,
+    image_bytes: bytes,
+    row_num: int,
+    start_col: int = 4,
+    end_col: int = 5,
+    padding: int = 4,
+) -> XLImage:
     pil_img = PILImage.open(BytesIO(image_bytes)).convert("RGB")
     orig_w, orig_h = pil_img.size
+
+    total_w = 0
+    for col_idx in range(start_col, end_col + 1):
+        col_letter = chr(64 + col_idx)
+        col_width = ws.column_dimensions[col_letter].width
+        total_w += excel_col_width_to_pixels(col_width)
+
+    row_h = row_height_to_pixels(ws.row_dimensions[row_num].height)
+
+    max_w = max(20, total_w - padding * 2)
+    max_h = max(20, row_h - padding * 2)
 
     ratio = min(max_w / orig_w, max_h / orig_h)
     new_w = max(1, int(orig_w * ratio))
@@ -203,6 +235,21 @@ def resize_image_for_excel(image_bytes: bytes, max_w: int = 140, max_h: int = 90
     xl_img = XLImage(buf)
     xl_img.width = new_w
     xl_img.height = new_h
+
+    offset_x = int((total_w - new_w) / 2)
+    offset_y = int((row_h - new_h) / 2)
+
+    marker = AnchorMarker(
+        col=start_col - 1,
+        colOff=pixels_to_EMU(max(0, offset_x)),
+        row=row_num - 1,
+        rowOff=pixels_to_EMU(max(0, offset_y)),
+    )
+
+    xl_img.anchor = OneCellAnchor(
+        _from=marker,
+        ext=XDRPositiveSize2D(pixels_to_EMU(new_w), pixels_to_EMU(new_h)),
+    )
     return xl_img
 
 
@@ -259,7 +306,6 @@ def rebuild_quote_section(ws, product_count: int):
     extra_rows = product_count - 1
     section_end = 27 + extra_rows
 
-    # 15행~하단 새 끝행까지의 병합 해제
     to_unmerge = [
         str(mr) for mr in list(ws.merged_cells.ranges)
         if not (mr.max_row < 15 or mr.min_row > section_end)
@@ -270,19 +316,16 @@ def rebuild_quote_section(ws, product_count: int):
         except Exception:
             pass
 
-    # 영역 초기화
     for r in range(15, section_end + 1):
         for c in range(1, 18):
             ws.cell(r, c).value = None
 
-    # 상품행(15행 템플릿 반복)
     product_row_merges = [mr for mr in section_merges if mr.min_row == 15 and mr.max_row == 15]
     for idx in range(product_count):
         row_num = 15 + idx
         apply_snapshot_row(ws, row_heights, row_data, 15, row_num)
 
         ws[f"B{row_num}"] = None
-        ws[f"D{row_num}"] = None
         ws[f"F{row_num}"] = None
         ws[f"L{row_num}"] = None
         ws[f"K{row_num}"] = 1
@@ -298,7 +341,6 @@ def rebuild_quote_section(ws, product_count: int):
                 end_column=mr.max_col,
             )
 
-    # 하단 블록(16~27행) 아래로 이동 복제
     footer_merges = [mr for mr in section_merges if mr.min_row >= 16]
     for src_row in range(16, 28):
         dst_row = src_row + extra_rows
@@ -312,12 +354,10 @@ def rebuild_quote_section(ws, product_count: int):
             end_column=mr.max_col,
         )
 
-    # 13행 합계 금액 수식 재연결
     total_row = 20 + extra_rows
     ws["E13"] = f"=P{total_row}"
     ws["L13"] = f"=P{total_row}"
 
-    # 운반 설치비 / 하단 합계 수식 재설정
     delivery_row = 16 + extra_rows
     supply_row = 17 + extra_rows
     tax_row = 18 + extra_rows
@@ -344,8 +384,14 @@ def write_product_row(ws, row_num: int, product: Dict[str, Optional[str]]) -> No
     if product["image_url"]:
         image_bytes = download_image_bytes(product["image_url"])
         if image_bytes:
-            img = resize_image_for_excel(image_bytes)
-            ws.add_image(img, f"D{row_num}")
+            img = create_centered_excel_image(
+                ws=ws,
+                image_bytes=image_bytes,
+                row_num=row_num,
+                start_col=4,
+                end_col=5,
+            )
+            ws.add_image(img)
 
 
 def build_quote(urls: List[str]) -> tuple[bytes, str]:
@@ -412,7 +458,7 @@ def main():
         return
 
     st.title("매직 견적서 생성기")
-    st.caption("15행부터 상품이 추가되고, 16~27행 하단 블록은 양식 그대로 아래로 이어집니다.")
+    st.caption("15행부터 상품이 추가되고, D:E 병합영역에 이미지가 가운데 정렬로 배치됩니다.")
 
     st.session_state.setdefault("logs", [])
 
